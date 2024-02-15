@@ -413,6 +413,15 @@ impl EthApi {
             EthRequest::OtsGetContractCreator(address) => {
                 self.ots_get_contract_creator(address).await.to_rpc_result()
             }
+            EthRequest::MevSimulateBlock(coinbase, timestamp, transactions) => {
+                if timestamp >= U256::from(u64::MAX) {
+                    return ResponseResult::Error(RpcError::invalid_params(
+                        "The timestamp is too big",
+                    ))
+                }
+                let timestamp = timestamp.to::<u64>();
+                self.mev_simulate_block(coinbase, timestamp, transactions).await.to_rpc_result()
+            }
         }
     }
 
@@ -2099,6 +2108,81 @@ impl EthApi {
 
         Ok(content)
     }
+}
+
+// === impl EthApi MEV functions ===
+impl EthApi {
+    pub fn parse_raw_transaction(&self, tx: Bytes) -> Result<PoolTransaction> {
+        
+        let mut data = tx.as_ref();
+        if data.is_empty() {
+            return Err(BlockchainError::EmptyRawTransactionData);
+        }
+        let transaction = if data[0] > 0x7f {
+            // legacy transaction
+            match Signed::<TxLegacy>::decode(&mut data) {
+                Ok(transaction) => TypedTransaction::Legacy(transaction),
+                Err(_) => return Err(BlockchainError::FailedToDecodeSignedTransaction),
+            }
+        } else {
+            let extend = alloy_rlp::encode(data);
+            let tx = match TypedTransaction::decode(&mut &extend[..]) {
+                Ok(transaction) => transaction,
+                Err(_) => return Err(BlockchainError::FailedToDecodeSignedTransaction),
+            };
+
+            self.ensure_typed_transaction_supported(&tx)?;
+            tx
+        };
+        let pending_transaction = PendingTransaction::new(transaction)?;
+
+        let from = *pending_transaction.sender();
+        let nonce = pending_transaction.transaction.nonce();
+        let requires = required_marker(nonce, nonce.saturating_sub(U256::from(1)), from);
+
+        let priority = self.transaction_priority(&pending_transaction.transaction);
+        let pool_transaction = PoolTransaction {
+            requires,
+            provides: vec![to_marker(nonce.to::<u64>(), *pending_transaction.sender())],
+            pending_transaction,
+            priority,
+        };
+
+        Ok(pool_transaction)
+    }
+
+
+    /// Given a coinbase address, a block timestamp and a list of raw transactions, returns the
+    /// block reward of the coinbase.
+    pub async fn mev_simulate_block(
+        &self,
+        coinbase: Address,
+        timestamp: u64,
+        transactions: Vec<Bytes>,
+    ) -> Result<(U256, U256)> {
+        node_info!("simulate_mine_detailed");
+
+        let pool_transactions: Vec<Arc<PoolTransaction>> = transactions
+            .into_iter()
+            .filter_map(|tx| {
+                match self.parse_raw_transaction(tx) {
+                    Ok(pool_transaction) => Some(Arc::new(pool_transaction)),
+                    Err(e) => {
+                        println!("Error parsing transaction: {:?}", e);
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        
+        node_info!("start simulate block");
+        
+        let (outcome, balance_before, balance_after) = self.backend.simulate_block(coinbase, timestamp, pool_transactions).await;
+
+        Ok((balance_before, balance_after))
+    }
+
 }
 
 // === impl EthApi utility functions ===

@@ -717,6 +717,14 @@ pub enum EthRequest {
     /// contract.
     #[cfg_attr(feature = "serde", serde(rename = "ots_getContractCreator", with = "sequence"))]
     OtsGetContractCreator(Address),
+
+    /// Simulate transactions and return the result
+    #[cfg_attr(feature = "serde", serde(rename = "mev_simulateBlock", with = "sequence"))]
+    MevSimulateBlock(
+        Address,
+        U256,
+        Vec<Bytes>
+    ),
 }
 
 /// Represents ethereum JSON-RPC API

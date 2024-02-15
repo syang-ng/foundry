@@ -1015,6 +1015,136 @@ impl Backend {
         outcome
     }
 
+    /// Simulates the execution of a block without writing to the DB
+    pub async fn simulate_block(
+        &self,
+        address: Address,
+        timestamp: u64,
+        pool_transactions: Vec<Arc<PoolTransaction>>,
+    ) -> (MinedBlockOutcome, U256, U256) {
+        trace!(target: "backend", "simulating new block with {} transactions", pool_transactions.len());
+
+        let balance_before = self.current_balance(address).await.unwrap_or_default();
+        let (outcome, header, block_hash) = {
+            let current_base_fee = self.base_fee();
+
+            let mut env = self.env.read().clone();
+
+            if env.block.basefee.is_zero() {
+                // this is an edge case because the evm fails if `tx.effective_gas_price < base_fee`
+                // 0 is only possible if it's manually set
+                env.cfg.disable_base_fee = true;
+            }
+
+            env.block.coinbase = address;
+            env.block.number = env.block.number.saturating_add(rU256::from(1));
+            env.block.basefee = current_base_fee;
+            env.block.timestamp = rU256::from(timestamp);
+
+            let best_hash = self.blockchain.storage.read().best_hash;
+
+            if self.prune_state_history_config.is_state_history_supported() {
+                let db = self.db.read().await.current_state();
+                // store current state before executing all transactions
+                self.states.write().insert(best_hash, db);
+            }
+
+            let (executed_tx, block_hash) = {
+                let mut db = self.db.write().await;
+                let executor = TransactionExecutor {
+                    db: &mut *db,
+                    validator: self,
+                    pending: pool_transactions.into_iter(),
+                    block_env: env.block.clone(),
+                    cfg_env: env.cfg.clone(),
+                    parent_hash: best_hash,
+                    gas_used: U256::ZERO,
+                    enable_steps_tracing: self.enable_steps_tracing,
+                };
+                let executed_tx = executor.execute();
+
+                // we also need to update the new blockhash in the db itself
+                let block_hash = executed_tx.block.block.header.hash();
+                db.insert_block_hash(U256::from(executed_tx.block.block.header.number), block_hash);
+
+                (executed_tx, block_hash)
+            };
+
+            // create the new block with the current timestamp
+            let ExecutedTransactions { block, included, invalid } = executed_tx;
+            let BlockInfo { block, transactions, receipts } = block;
+
+            let header = block.header.clone();
+            let block_number: U64 = env.block.number.to::<U64>();
+
+            trace!(
+                target: "backend",
+                "Mined block {} with {} tx {:?}",
+                block_number,
+                transactions.len(),
+                transactions.iter().map(|tx| tx.transaction_hash).collect::<Vec<_>>()
+            );
+
+            let mut storage = self.blockchain.storage.write();
+            // update block metadata
+            storage.best_number = block_number;
+            storage.best_hash = block_hash;
+            // Difficulty is removed and not used after Paris (aka TheMerge). Value is replaced with
+            // prevrandao. https://github.com/bluealloy/revm/blob/1839b3fce8eaeebb85025576f2519b80615aca1e/crates/interpreter/src/instructions/host_env.rs#L27
+            if !self.is_eip3675() {
+                storage.total_difficulty =
+                    storage.total_difficulty.saturating_add(header.difficulty);
+            }
+
+            storage.blocks.insert(block_hash, block);
+            storage.hashes.insert(block_number, block_hash);
+
+            // insert all transactions
+            for (info, receipt) in transactions.into_iter().zip(receipts) {
+                // log some tx info
+                node_info!("    Transaction: {:?}", info.transaction_hash);
+                if let Some(contract) = &info.contract_address {
+                    node_info!("    Contract created: {contract:?}");
+                }
+                node_info!("    Gas used: {}", receipt.gas_used());
+                if !info.exit.is_ok() {
+                    let r = decode_revert(
+                        info.out.clone().unwrap_or_default().as_ref(),
+                        None,
+                        Some(info.exit),
+                    );
+                    node_info!("    Error: reverted with: {r}");
+                }
+                node_info!("");
+
+                let mined_tx = MinedTransaction {
+                    info,
+                    receipt,
+                    block_hash,
+                    block_number: block_number.to::<u64>(),
+                };
+                storage.transactions.insert(mined_tx.info.transaction_hash, mined_tx);
+            }
+
+            // update env with new values
+            *self.env.write() = env;
+
+            let timestamp = utc_from_secs(header.timestamp);
+
+            node_info!("    Block Number: {}", block_number);
+            node_info!("    Block Hash: {:?}", block_hash);
+            node_info!("    Block Time: {:?}\n", timestamp.to_rfc2822());
+
+            let outcome = MinedBlockOutcome { block_number, included, invalid };
+
+            (outcome, header, block_hash)
+        };
+
+        let balance_after = self.current_balance(address).await.unwrap_or_default();
+
+        (outcome, balance_before, balance_after)
+    }
+
     /// Executes the [TransactionRequest] without writing to the DB
     ///
     /// # Errors
